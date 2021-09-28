@@ -1,4 +1,4 @@
-# AKS **App Gateway Ingress Controller" Deployment
+# AKS **App Gateway Ingress Controller** Deployment
 Security focused deployment of AGIC on AKS where I'm trying to achieve the following:
 
 - Provisioning for Azure Resources:
