@@ -8,6 +8,7 @@ LOCATION=westeurope
 RG=$PREFIX-rg
 UNIQUE_ID=14072
 echo "Unique id: " $UNIQUE_ID
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
 # Network
 VNET_NAME=$PREFIX-vnet
@@ -35,6 +36,7 @@ echo $CONTAINER_REGISTRY_NAME
 # AKS
 AKS_NAME=$PREFIX-aks
 AKS_MI_NAME=$AKS_NAME-mi
+AKS_KUBELET_MI_NAME=$AKS_NAME-kublet-mi
 
 # AGIC Managed Identity
 AGIC_MI_NAME=$APPGW-mi
@@ -51,6 +53,8 @@ az account set --subscription "SUB-NAME"
 ##################
 
 az group create --name $RG --location $LOCATION
+RG_ID=$(az group show --name $RG --query id -o tsv)
+echo $RG_ID
 
 ###################
 # Virtual Network #
@@ -258,9 +262,8 @@ echo $AKS_MI_RESOURCE_ID
 ### Create new AKS cluster with Azure CNI as network interface
 echo "Assigning roles to new MI"
 # I will give a contributor access on the resource group that holds directly provisioned resources by AKS
-RG_ID=$(az group show --name $RG --query id -o tsv)
-echo $RG_AKS_ID
-az role assignment create --assignee $AKS_MI_ID --scope $RG_AKS_ID --role "Contributor"
+
+az role assignment create --assignee $AKS_MI_ID --scope $RG_ID --role "Contributor"
 # In better setup, you will assign more granular permissions.
 # Example: Granular access (incase the spoke network is shared with other workloads)
 # AKS_SUBNET_ID=$(az network vnet subnet show -g $RG_SHARED --vnet-name $PROJ_VNET_NAME --name $AKS_SUBNET_NAME --query id -o tsv)
@@ -270,10 +273,28 @@ az role assignment create --assignee $AKS_MI_ID --scope $RG_AKS_ID --role "Contr
 # az role assignment create --assignee $AKS_MI_ID --scope $AKS_SVC_SUBNET_ID --role "Network Contributor"
 # az role assignment create --assignee $AKS_MI_ID --scope $AKS_VN_SUBNET_ID --role "Network Contributor"
 
-# Review the current SP assignments
+# Review the current assignments
 az role assignment list \
     --all \
     --assignee $AKS_MI_ID \
+    --output json | jq '.[] | {"principalName":.principalName, "roleDefinitionName":.roleDefinitionName, "scope":.scope}'
+
+### AKS Kubelet MI
+
+az identity create --name $AKS_KUBELET_MI_NAME --resource-group $RG
+AKS_KUBELET_MI=$(az identity show -n $AKS_KUBELET_MI_NAME -g $RG)
+# install jq if you don't have it --> sudo apt-get install jq
+echo $AKS_KUBELET_MI | jq
+AKS_KUBELET_MI_CLIENT_ID=$(echo $AKS_KUBELET_MI | jq -r .principalId)
+echo $AKS_KUBELET_MI_CLIENT_ID
+AKS_KUBELET_MI_RESOURCE_ID=$(echo $AKS_MI | jq -r .id)
+echo $AKS_KUBELET_MI_RESOURCE_ID
+
+# Include any MI outside the nodes resource group as well (assuming all of them here in the main resource group. Feel free to be more granular)
+az role assignment create --role "Managed Identity Operator" --assignee $AKS_KUBELET_MI_CLIENT_ID --scope $RG_ID
+az role assignment list \
+    --all \
+    --assignee $AKS_KUBELET_MI_CLIENT_ID \
     --output json | jq '.[] | {"principalName":.principalName, "roleDefinitionName":.roleDefinitionName, "scope":.scope}'
 
 ### AKS supported versions
@@ -294,7 +315,8 @@ az aks create \
     --max-pods 30 \
     --node-vm-size "Standard_D4s_v3" \
     --enable-managed-identity \
-    --assign-identity $AKS_MI_RESOURCE_ID
+    --assign-identity $AKS_MI_RESOURCE_ID \
+    --assign-kubelet-identity $AKS_KUBELET_MI_RESOURCE_ID
 
 ### Get access to AKS
 az aks get-credentials --resource-group $RG --name $AKS_NAME
@@ -304,8 +326,17 @@ az aks get-credentials --resource-group $RG --name $AKS_NAME
 kubectl get nodes
 
 
+
 ### Installation of AAD Pod Identity
-# We will be using "Managed" mode of pod identity, which is the only supported scenario in AKS plugin
+
+### Permissions to Kubelet MI needed by AAD Pod Identity
+AKS_NODES_RG=$(az aks show -g $RG -n $AKS_NAME --query nodeResourceGroup -o tsv)
+AKS_NODES_RG_RESOURCE_ID=$(az group show -n $AKS_NODES_RG -o tsv --query "id")
+echo $AKS_NODES_RG
+echo $AKS_NODES_RG_RESOURCE_ID
+# permissions over the nodes resource group
+az role assignment create --role "Managed Identity Operator" --assignee $AKS_KUBELET_MI_CLIENT_ID --scope $AKS_NODES_RG_RESOURCE_ID
+az role assignment create --role "Virtual Machine Contributor" --assignee $AKS_KUBELET_MI_CLIENT_ID --scope $AKS_NODES_RG_RESOURCE_ID
 
 # or installing via helm
 # Get helm if you don't already have it
@@ -329,6 +360,7 @@ az extension add --name aks-preview
 az extension update --name aks-preview
 # Update AKS cluster with the AAD pod identity plugin
 az feature register --name EnablePodIdentityPreview --namespace Microsoft.ContainerService
+
 az aks update -g $RG -n $AKS --enable-pod-identity
 
 
@@ -337,7 +369,7 @@ az aks update -g $RG -n $AKS --enable-pod-identity
 #########################
 
 az identity create -g $RG -n $AGIC_MI_NAME
-AGIC_MI_ID=$(az identity show -g $RG -n $AGIC_MI_NAME --query id)
+AGIC_MI_ID=$(az identity show -g $RG -n $AGIC_MI_NAME --query id -o tsv)
 AGIC_MI_CLIENT_ID=$(az identity show -g $RG -n $AGIC_MI_NAME --query clientId -o tsv)
 echo $AGIC_MI_ID
 echo $AGIC_MI_CLIENT_ID
@@ -348,9 +380,108 @@ az role assignment create \
     --assignee $AGIC_MI_CLIENT_ID \
     --scope $APPGW_RESOURCE_ID
 
+az role assignment create \
+    --role "Reader" \
+    --assignee $AGIC_MI_CLIENT_ID \
+    --scope $RG_ID
+
+# Review the current assignments
+az role assignment list \
+    --all \
+    --assignee $AGIC_MI_CLIENT_ID \
+    --output json | jq '.[] | {"principalName":.principalName, "roleDefinitionName":.roleDefinitionName, "scope":.scope}'
+
+# Now assign "Managed Idenity Operartor" to AKS MI, just to be safe
+az role assignment create \
+  --role "Managed Identity Operator" \
+  --assignee $AKS_MI_ID \
+  --scope $AGIC_MI_ID
+
+az role assignment create \
+  --role "Managed Identity Operator" \
+  --assignee $AKS_KUBELET_MI_CLIENT_ID \
+  --scope $AGIC_MI_ID
+
+
+# Now configure AAD Pod Identity to use this managed identity
+cat <<EOF | kubectl apply -f -
+apiVersion: "aadpodidentity.k8s.io/v1"
+kind: AzureIdentity
+metadata:
+  name: ${AGIC_MI_NAME}
+spec:
+  type: 0
+  resourceID: ${AGIC_MI_ID}
+  clientID: ${AGIC_MI_CLIENT_ID}
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: "aadpodidentity.k8s.io/v1"
+kind: AzureIdentityBinding
+metadata:
+  name: ${AGIC_MI_NAME}-binding
+spec:
+  azureIdentity: ${AGIC_MI_NAME}
+  selector: ingress-azure
+EOF
+
+
 ###############
 # AGIC on AKS #
 ###############
 
 helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
 helm repo update
+# I have included a basic config file for the helm deployment, updated file can be downloaded here:
+# wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-config.yaml
+
+# Indicate that App GW is shared with other cluster or services. I will default to flase. This can be updated later
+SHARED_AGW_FLAG=false
+# In case, requirement is to restrict all Ingresses to be exposed over Private IP, use true in this flag
+PRIVATE_IP_AGW_FLAG=false
+
+# Replacing values in the helm-config:
+sed ./agic-helm-config.yaml \
+    -e 's@<subscriptionId>@'"${SUBSCRIPTION_ID}"'@g' \
+    -e 's@<resourceGroupName>@'"${RG}"'@g' \
+    -e 's@<applicationGatewayName>@'"${APPGW}"'@g' \
+    -e 's@<identityResourceId>@'"${AGIC_MI_ID}"'@g' \
+    -e 's@<identityClientId>@'"${AGIC_MI_CLIENT_ID}"'@g' \
+    -e "s/\(^.*usePrivateIP: \).*/\1${PRIVATE_IP_AGW_FLAG}/gI" \
+    -e "s/\(^.*shared: \).*/\1${SHARED_AGW_FLAG}/gI" \
+    -e "s/\(^.*enabled: \).*/\1true/gI" \
+    > ./agic-helm-config-updated.yaml
+
+# have a final look on the yaml before deploying :)
+cat agic-helm-config-updated.yaml
+
+# see the latest versions of AGIC
+helm search repo application-gateway-kubernetes-ingress/ingress-azure --versions --devel
+AGIC_VERSION=1.4.0
+
+# create a namespace for AGIC
+AGIC_NAMESPACE=agic
+kubectl create namespace $AGIC_NAMESPACE
+
+# Ready to pull the trigger on AGIC installation:
+sudo helm install ingress-azure-3 \
+  -f agic-helm-config-updated.yaml \
+  application-gateway-kubernetes-ingress/ingress-azure \
+  --namespace $AGIC_NAMESPACE \
+  --version $AGIC_VERSION
+
+kubectl get po -n $AGIC_NAMESPACE
+kubectl describe po -n $AGIC_NAMESPACE
+kubectl logs -n $AGIC_NAMESPACE ingress-azure-5445dcc466-rk7zl
+
+az role assignment create --role Reader --scope /subscriptions/d51d943c-cd99-4d72-ab4c-b212f7a204c0/resourceGroups/agic-dev-rg --assignee ec405072-1b91-48f4-a7be-cab8e2c8c24e
+az role assignment create --role Contributor --scope /subscriptions/d51d943c-cd99-4d72-ab4c-b212f7a204c0/resourceGroups/agic-dev-rg/providers/Microsoft.Network/applicationGateways/agic-dev-appgw --assignee ec405072-1b91-48f4-a7be-cab8e2c8c24e
+
+helm uninstall ingress-azure \
+  -f agic-helm-config-updated.yaml \
+  application-gateway-kubernetes-ingress/ingress-azure \
+  --namespace $AGIC_NAMESPACE \
+  --version $AGIC_VERSION
+
+
+az aks enable-addons -n $AKS_NAME -g $RG -a ingress-appgw --appgw-id $APPGW_RESOURCE_ID
